@@ -26,6 +26,10 @@ is_listening = False
 stream = None
 transcription_queue = queue.Queue()
 
+# Track what's already typed to avoid duplicates
+last_typed_text = ""
+last_transcribed_text = ""
+
 # Whisper model (loaded once)
 whisper_model = None
 model_lock = threading.Lock()
@@ -68,6 +72,8 @@ def audio_callback(indata, frames, time_info, status):
 
 def transcribe_thread():
     """Background thread for transcription."""
+    global last_transcribed_text
+    
     while True:
         if not is_listening:
             time.sleep(0.1)
@@ -87,25 +93,53 @@ def transcribe_thread():
             # Get transcribed text
             text = " ".join([seg.text for seg in segments]).strip()
             
-            if text:
-                transcription_queue.put(text)
+            if text and text != last_transcribed_text:
+                transcription_queue.put((text, last_transcribed_text))
+                last_transcribed_text = text
         
         except Exception as e:
             print(f"Transcription error: {e}")
         
-        time.sleep(0.5)  # Transcribe every 0.5 seconds
+        time.sleep(0.3)  # Transcribe every 0.3 seconds
 
 
-def type_text(text):
-    """Type text to active window."""
-    if text:
-        print(f"📝 Typing: {text}")
-        pyautogui.write(text, interval=0.02)
+def type_text(new_text, previous_text):
+    """Type only the new text (delta) to active window."""
+    global last_typed_text
+    
+    if not new_text:
+        return
+    
+    # If there's no previous text, type everything
+    if not previous_text:
+        print(f"📝 Typing: {new_text}")
+        pyautogui.write(new_text, interval=0.02)
+        last_typed_text = new_text
+        return
+    
+    # Find the delta - what new text was added
+    # Common prefix between previous and new
+    common_prefix_len = 0
+    for i, (c1, c2) in enumerate(zip(previous_text, new_text)):
+        if c1 == c2:
+            common_prefix_len = i + 1
+        else:
+            break
+    
+    # Get the new part that wasn't in previous transcription
+    new_delta = new_text[common_prefix_len:].strip()
+    
+    if new_delta:
+        print(f"📝 Typing delta: {new_delta}")
+        pyautogui.write(new_delta, interval=0.02)
+        last_typed_text = new_text
+    else:
+        print(f"📝 No new text (same as before)")
 
 
 def toggle_listening():
     """Toggle listening state."""
-    global is_listening, stream
+    global is_listening, stream, last_typed_text, last_transcribed_text
     
     if is_listening:
         # Stop listening
@@ -120,6 +154,10 @@ def toggle_listening():
         audio_chunks.clear()
         while not transcription_queue.empty():
             transcription_queue.get()
+        
+        # Reset tracking
+        last_typed_text = ""
+        last_transcribed_text = ""
         
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -177,8 +215,8 @@ def main_loop():
     try:
         while True:
             try:
-                text = transcription_queue.get(timeout=0.1)
-                type_text(text)
+                new_text, prev_text = transcription_queue.get(timeout=0.1)
+                type_text(new_text, prev_text)
             except queue.Empty:
                 pass
     
