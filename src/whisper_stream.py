@@ -2,6 +2,8 @@
 """
 WhisperStream - Real-time Transcription + Auto-Typer
 Hotkey: Ctrl+Shift+Space to start/stop listening
+
+Strategy: Wait for brief silence, then type the stable transcription
 """
 
 import sounddevice as sd
@@ -18,21 +20,21 @@ SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.5  # seconds per audio chunk
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
 
-# Minimum delta to type (avoid single chars/noise)
-MIN_DELTA_LENGTH = 3
+# Silence detection
+SILENCE_THRESHOLD = 0.01  # RMS threshold for silence
+SILENCE_DURATION = 1.0  # seconds of silence before typing
 
-# Audio buffer - store raw chunks
-audio_chunks = deque(maxlen=10)  # Keep last 10 chunks (~5 seconds)
+# Audio buffer and silence tracking
+audio_chunks = deque(maxlen=10)
+silence_start_time = None
 
 # State
 is_listening = False
 stream = None
 transcription_queue = queue.Queue()
 
-# Track what's actually typed on screen
-last_typed_text = ""
-last_transcribed_text = ""
-typed_char_count = 0  # Track actual characters typed
+# Track what's typed
+typed_text = ""
 
 # Whisper model (loaded once)
 whisper_model = None
@@ -53,6 +55,8 @@ def load_whisper_model():
 
 def audio_callback(indata, frames, time_info, status):
     """Capture audio chunks while listening."""
+    global silence_start_time
+    
     if status:
         print(f"Audio status: {status}")
     
@@ -67,99 +71,63 @@ def audio_callback(indata, frames, time_info, status):
     if indata.max() > 1.0:
         indata = indata / 32768.0
     
-    # Check if there's actual speech (simple VAD - volume threshold)
+    # Check for speech/silence
     rms = np.sqrt(np.mean(indata ** 2))
-    if rms > 0.01:  # Threshold for speech
+    
+    if rms > SILENCE_THRESHOLD:
+        # Speech detected
+        if silence_start_time is not None:
+            silence_start_time = None  # Reset silence timer
         audio_chunks.append(indata.copy())
+    else:
+        # Silence
+        if silence_start_time is None:
+            silence_start_time = time.time()
 
 
-def transcribe_thread():
-    """Background thread for transcription."""
-    global last_transcribed_text
+def transcribe_and_wait():
+    """Transcribe when there's silence, then type."""
+    global typed_text
     
     while True:
         if not is_listening:
             time.sleep(0.1)
             continue
         
-        if len(audio_chunks) < 2:  # Need at least 1 second
-            time.sleep(0.1)
-            continue
+        # Check if we've had enough silence to type
+        if silence_start_time and (time.time() - silence_start_time) >= SILENCE_DURATION:
+            if len(audio_chunks) >= 2:
+                # Combine all chunks
+                audio_data = np.concatenate(list(audio_chunks))
+                
+                try:
+                    model = load_whisper_model()
+                    segments, info = model.transcribe(audio_data, beam_size=5, language="en")
+                    
+                    text = " ".join([seg.text for seg in segments]).strip()
+                    
+                    if text and text != typed_text:
+                        # Find what to add
+                        new_text = text[len(typed_text):].strip()
+                        
+                        if new_text and len(new_text) >= 2:
+                            print(f"📝 Typing (after silence): {new_text}")
+                            pyautogui.write(new_text, interval=0.02)
+                            typed_text = text
+                
+                except Exception as e:
+                    print(f"Transcription error: {e}")
+                
+                # Reset after typing
+                audio_chunks.clear()
+                silence_start_time = None
         
-        # Combine all chunks
-        audio_data = np.concatenate(list(audio_chunks))
-        
-        try:
-            model = load_whisper_model()
-            segments, info = model.transcribe(audio_data, beam_size=5, language="en")
-            
-            # Get transcribed text
-            text = " ".join([seg.text for seg in segments]).strip()
-            
-            if text and text != last_transcribed_text:
-                transcription_queue.put((text, last_transcribed_text))
-                last_transcribed_text = text
-        
-        except Exception as e:
-            print(f"Transcription error: {e}")
-        
-        time.sleep(0.3)  # Transcribe every 0.3 seconds
-
-
-def type_text(new_text, previous_text):
-    """Type only the new text (delta) to active window."""
-    global last_typed_text, typed_char_count
-    
-    if not new_text:
-        return
-    
-    # If there's no previous text, type everything
-    if not previous_text:
-        print(f"📝 Typing full: {new_text}")
-        pyautogui.write(new_text, interval=0.02)
-        last_typed_text = new_text
-        typed_char_count = len(new_text)
-        return
-    
-    # Find the delta - what new text was added
-    # Common prefix between previous and new
-    common_prefix_len = 0
-    for i, (c1, c2) in enumerate(zip(previous_text, new_text)):
-        if c1 == c2:
-            common_prefix_len = i + 1
-        else:
-            break
-    
-    # Get the new part that wasn't in previous transcription
-    new_delta = new_text[common_prefix_len:].strip()
-    
-    # Skip if delta is too short (avoid noise/single chars)
-    if len(new_delta) < MIN_DELTA_LENGTH:
-        print(f"  ⏭️ Skipping delta (too short): '{new_delta}'")
-        return
-    
-    # Skip if new text is NOT longer than what we've typed
-    # This handles the case where Whisper rewrites the sentence
-    if len(new_text) <= typed_char_count:
-        print(f"  ⏭️ Skipping - no new content")
-        return
-    
-    # Calculate actual new content based on what we've typed
-    # Start from where we left off
-    actual_delta = new_text[typed_char_count:].strip()
-    
-    if actual_delta and len(actual_delta) >= MIN_DELTA_LENGTH:
-        print(f"📝 Typing delta: '{actual_delta}'")
-        pyautogui.write(actual_delta, interval=0.02)
-        last_typed_text = new_text
-        typed_char_count += len(actual_delta)
-    else:
-        print(f"  ⏭️ No valid delta to type")
+        time.sleep(0.1)
 
 
 def toggle_listening():
     """Toggle listening state."""
-    global is_listening, stream, last_typed_text, last_transcribed_text, typed_char_count
+    global is_listening, stream, typed_text, silence_start_time, audio_chunks
     
     if is_listening:
         # Stop listening
@@ -172,13 +140,10 @@ def toggle_listening():
     else:
         # Start listening
         audio_chunks.clear()
+        silence_start_time = None
+        typed_text = ""
         while not transcription_queue.empty():
             transcription_queue.get()
-        
-        # Reset tracking
-        last_typed_text = ""
-        last_transcribed_text = ""
-        typed_char_count = 0
         
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -189,7 +154,7 @@ def toggle_listening():
         )
         stream.start()
         is_listening = True
-        print("\n🎙️ Listening... (Ctrl+Shift+Space to stop)")
+        print("\n🎙️ Listening... (speak, then pause to type)")
 
 
 def on_activate():
@@ -199,19 +164,19 @@ def on_activate():
 
 
 def main_loop():
-    """Main loop - process transcriptions and type."""
+    """Main loop."""
     print("""
 ╔══════════════════════════════════════════╗
 ║     WhisperStream - Auto-Typer           ║
 ╠══════════════════════════════════════════╣
 ║  Press Ctrl+Shift+Space to start/stop   ║
-║  Place cursor in text field to type      ║
+║  Speak, then pause briefly to type       ║
 ║  Press Ctrl+C to exit                    ║
 ╚══════════════════════════════════════════╝
 """)
     
     # Start transcription thread
-    t = threading.Thread(target=transcribe_thread, daemon=True)
+    t = threading.Thread(target=transcribe_and_wait, daemon=True)
     t.start()
     
     # Setup keyboard listener
@@ -232,14 +197,9 @@ def main_loop():
     )
     listener.start()
     
-    # Main typing loop
     try:
         while True:
-            try:
-                new_text, prev_text = transcription_queue.get(timeout=0.1)
-                type_text(new_text, prev_text)
-            except queue.Empty:
-                pass
+            time.sleep(0.1)
     
     except KeyboardInterrupt:
         print("\n👋 Exiting...")
