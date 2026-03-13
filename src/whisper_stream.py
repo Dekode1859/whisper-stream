@@ -9,6 +9,7 @@ import numpy as np
 from collections import deque
 import time
 import threading
+import queue
 import pyautogui
 from pynput import keyboard
 
@@ -17,12 +18,30 @@ SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.5  # seconds per audio chunk
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
 
-# Audio buffer
-audio_buffer = deque(maxlen=int(SAMPLE_RATE * 3.0))
+# Audio buffer - store raw chunks
+audio_chunks = deque(maxlen=10)  # Keep last 10 chunks (~5 seconds)
 
 # State
 is_listening = False
 stream = None
+transcription_queue = queue.Queue()
+
+# Whisper model (loaded once)
+whisper_model = None
+model_lock = threading.Lock()
+
+
+def load_whisper_model():
+    """Load faster-whisper model (thread-safe)."""
+    global whisper_model
+    with model_lock:
+        if whisper_model is None:
+            print("Loading Whisper model (base)... this may take a moment")
+            from faster_whisper import WhisperModel
+            # Use base model - downloads automatically on first run
+            whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+            print("✅ Whisper model loaded")
+    return whisper_model
 
 
 def audio_callback(indata, frames, time_info, status):
@@ -37,52 +56,50 @@ def audio_callback(indata, frames, time_info, status):
     if indata.dtype != np.float32:
         indata = indata.astype(np.float32)
     
+    # Normalize
     if indata.max() > 1.0:
         indata = indata / 32768.0
     
-    audio_buffer.extend(indata)
+    # Check if there's actual speech (simple VAD - volume threshold)
+    rms = np.sqrt(np.mean(indata ** 2))
+    if rms > 0.01:  # Threshold for speech
+        audio_chunks.append(indata.copy())
 
 
-# Whisper model (loaded once)
-whisper_model = None
-
-
-def load_whisper_model():
-    """Load faster-whisper model."""
-    global whisper_model
-    if whisper_model is None:
-        print("Loading Whisper model (base)... this may take a moment")
-        from faster_whisper import WhisperModel
-        # Use base model - downloadsv automatically on first run
-        whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-        print("✅ Whisper model loaded")
-    return whisper_model
-
-
-def transcribe_buffer():
-    """Transcribe the current audio buffer."""
-    if len(audio_buffer) < SAMPLE_RATE * 0.5:  # Need at least 0.5s of audio
-        return None
-    
-    # Get audio data
-    audio_data = np.array(audio_buffer, dtype=np.float32)
-    
-    try:
-        model = load_whisper_model()
-        segments, info = model.transcribe(audio_data, beam_size=5)
+def transcribe_thread():
+    """Background thread for transcription."""
+    while True:
+        if not is_listening:
+            time.sleep(0.1)
+            continue
         
-        # Get transcribed text
-        text = " ".join([seg.text for seg in segments])
-        return text.strip()
-    
-    except Exception as e:
-        print(f"Transcription error: {e}")
-        return None
+        if len(audio_chunks) < 2:  # Need at least 1 second
+            time.sleep(0.1)
+            continue
+        
+        # Combine all chunks
+        audio_data = np.concatenate(list(audio_chunks))
+        
+        try:
+            model = load_whisper_model()
+            segments, info = model.transcribe(audio_data, beam_size=5, language="en")
+            
+            # Get transcribed text
+            text = " ".join([seg.text for seg in segments]).strip()
+            
+            if text:
+                transcription_queue.put(text)
+        
+        except Exception as e:
+            print(f"Transcription error: {e}")
+        
+        time.sleep(0.5)  # Transcribe every 0.5 seconds
 
 
 def type_text(text):
     """Type text to active window."""
     if text:
+        print(f"📝 Typing: {text}")
         pyautogui.write(text, interval=0.02)
 
 
@@ -100,7 +117,10 @@ def toggle_listening():
         print("\n🛑 Stopped listening")
     else:
         # Start listening
-        audio_buffer.clear()
+        audio_chunks.clear()
+        while not transcription_queue.empty():
+            transcription_queue.get()
+        
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             blocksize=CHUNK_SIZE,
@@ -115,12 +135,12 @@ def toggle_listening():
 
 def on_activate():
     """Called when hotkey is pressed."""
-    print("\n" + "=" * 40)
+    print("=" * 40)
     toggle_listening()
 
 
 def main_loop():
-    """Main loop - process audio and type."""
+    """Main loop - process transcriptions and type."""
     print("""
 ╔══════════════════════════════════════════╗
 ║     WhisperStream - Auto-Typer           ║
@@ -131,10 +151,11 @@ def main_loop():
 ╚══════════════════════════════════════════╝
 """)
     
-    # Setup keyboard listener
-    def for_canonical(f):
-        return lambda k: f(listener.canonical(k))
+    # Start transcription thread
+    t = threading.Thread(target=transcribe_thread, daemon=True)
+    t.start()
     
+    # Setup keyboard listener
     hotkey = {keyboard.Key.ctrl_l, keyboard.Key.shift, keyboard.Key.space}
     current = set()
     
@@ -152,17 +173,14 @@ def main_loop():
     )
     listener.start()
     
-    # Main processing loop
+    # Main typing loop
     try:
         while True:
-            if is_listening and len(audio_buffer) >= SAMPLE_RATE * 0.5:
-                # Transcribe
-                text = transcribe_buffer()
-                if text:
-                    print(f"📝 Transcribed: {text[:50]}...")
-                    type_text(text)
-            
-            time.sleep(0.1)
+            try:
+                text = transcription_queue.get(timeout=0.1)
+                type_text(text)
+            except queue.Empty:
+                pass
     
     except KeyboardInterrupt:
         print("\n👋 Exiting...")
