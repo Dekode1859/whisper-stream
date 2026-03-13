@@ -24,17 +24,16 @@ CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
 SILENCE_THRESHOLD = 0.01  # RMS threshold for silence
 SILENCE_DURATION = 1.0  # seconds of silence before typing
 
-# Audio buffer and silence tracking
-audio_chunks = deque(maxlen=10)
-silence_start_time = None
+# State - using a class to avoid global issues
+class State:
+    def __init__(self):
+        self.audio_chunks = deque(maxlen=20)
+        self.silence_start_time = None
+        self.is_listening = False
+        self.stream = None
+        self.typed_text = ""
 
-# State
-is_listening = False
-stream = None
-transcription_queue = queue.Queue()
-
-# Track what's typed
-typed_text = ""
+state = State()
 
 # Whisper model (loaded once)
 whisper_model = None
@@ -55,8 +54,6 @@ def load_whisper_model():
 
 def audio_callback(indata, frames, time_info, status):
     """Capture audio chunks while listening."""
-    global silence_start_time
-    
     if status:
         print(f"Audio status: {status}")
     
@@ -76,29 +73,27 @@ def audio_callback(indata, frames, time_info, status):
     
     if rms > SILENCE_THRESHOLD:
         # Speech detected
-        if silence_start_time is not None:
-            silence_start_time = None  # Reset silence timer
-        audio_chunks.append(indata.copy())
+        if state.silence_start_time is not None:
+            state.silence_start_time = None  # Reset silence timer
+        state.audio_chunks.append(indata.copy())
     else:
         # Silence
-        if silence_start_time is None:
-            silence_start_time = time.time()
+        if state.silence_start_time is None:
+            state.silence_start_time = time.time()
 
 
 def transcribe_and_wait():
     """Transcribe when there's silence, then type."""
-    global typed_text
-    
     while True:
-        if not is_listening:
+        if not state.is_listening:
             time.sleep(0.1)
             continue
         
         # Check if we've had enough silence to type
-        if silence_start_time and (time.time() - silence_start_time) >= SILENCE_DURATION:
-            if len(audio_chunks) >= 2:
+        if state.silence_start_time and (time.time() - state.silence_start_time) >= SILENCE_DURATION:
+            if len(state.audio_chunks) >= 2:
                 # Combine all chunks
-                audio_data = np.concatenate(list(audio_chunks))
+                audio_data = np.concatenate(list(state.audio_chunks))
                 
                 try:
                     model = load_whisper_model()
@@ -106,54 +101,50 @@ def transcribe_and_wait():
                     
                     text = " ".join([seg.text for seg in segments]).strip()
                     
-                    if text and text != typed_text:
+                    if text and text != state.typed_text:
                         # Find what to add
-                        new_text = text[len(typed_text):].strip()
+                        new_text = text[len(state.typed_text):].strip()
                         
                         if new_text and len(new_text) >= 2:
                             print(f"📝 Typing (after silence): {new_text}")
                             pyautogui.write(new_text, interval=0.02)
-                            typed_text = text
+                            state.typed_text = text
                 
                 except Exception as e:
                     print(f"Transcription error: {e}")
                 
                 # Reset after typing
-                audio_chunks.clear()
-                silence_start_time = None
+                state.audio_chunks.clear()
+                state.silence_start_time = None
         
         time.sleep(0.1)
 
 
 def toggle_listening():
     """Toggle listening state."""
-    global is_listening, stream, typed_text, silence_start_time, audio_chunks
-    
-    if is_listening:
+    if state.is_listening:
         # Stop listening
-        if stream:
-            stream.stop()
-            stream.close()
-            stream = None
-        is_listening = False
+        if state.stream:
+            state.stream.stop()
+            state.stream.close()
+            state.stream = None
+        state.is_listening = False
         print("\n🛑 Stopped listening")
     else:
         # Start listening
-        audio_chunks.clear()
-        silence_start_time = None
-        typed_text = ""
-        while not transcription_queue.empty():
-            transcription_queue.get()
+        state.audio_chunks.clear()
+        state.silence_start_time = None
+        state.typed_text = ""
         
-        stream = sd.InputStream(
+        state.stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             blocksize=CHUNK_SIZE,
             channels=1,
             dtype=np.float32,
             callback=audio_callback
         )
-        stream.start()
-        is_listening = True
+        state.stream.start()
+        state.is_listening = True
         print("\n🎙️ Listening... (speak, then pause to type)")
 
 
@@ -203,9 +194,9 @@ def main_loop():
     
     except KeyboardInterrupt:
         print("\n👋 Exiting...")
-        if stream:
-            stream.stop()
-            stream.close()
+        if state.stream:
+            state.stream.stop()
+            state.stream.close()
         listener.stop()
 
 
