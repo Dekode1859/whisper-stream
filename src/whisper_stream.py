@@ -43,22 +43,41 @@ def audio_callback(indata, frames, time_info, status):
     audio_buffer.extend(indata)
 
 
+# Whisper model (loaded once)
+whisper_model = None
+
+
+def load_whisper_model():
+    """Load faster-whisper model."""
+    global whisper_model
+    if whisper_model is None:
+        print("Loading Whisper model (base)... this may take a moment")
+        from faster_whisper import WhisperModel
+        # Use base model - downloadsv automatically on first run
+        whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+        print("✅ Whisper model loaded")
+    return whisper_model
+
+
 def transcribe_buffer():
     """Transcribe the current audio buffer."""
     if len(audio_buffer) < SAMPLE_RATE * 0.5:  # Need at least 0.5s of audio
         return None
     
     # Get audio data
-    audio_data = np.array(audio_buffer)
+    audio_data = np.array(audio_buffer, dtype=np.float32)
     
-    # TODO: Replace with actual whisper.cpp call
-    # For now, return placeholder
-    # import whispercpp
-    # model = whispercpp.Model.from_pretrained("base")
-    # return model.transcribe(audio_data)
+    try:
+        model = load_whisper_model()
+        segments, info = model.transcribe(audio_data, beam_size=5)
+        
+        # Get transcribed text
+        text = " ".join([seg.text for seg in segments])
+        return text.strip()
     
-    # Placeholder: just return empty for testing
-    return ""
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return None
 
 
 def type_text(text):
