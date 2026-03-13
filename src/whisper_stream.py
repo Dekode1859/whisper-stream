@@ -18,6 +18,9 @@ SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.5  # seconds per audio chunk
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
 
+# Minimum delta to type (avoid single chars/noise)
+MIN_DELTA_LENGTH = 3
+
 # Audio buffer - store raw chunks
 audio_chunks = deque(maxlen=10)  # Keep last 10 chunks (~5 seconds)
 
@@ -26,9 +29,10 @@ is_listening = False
 stream = None
 transcription_queue = queue.Queue()
 
-# Track what's already typed to avoid duplicates
+# Track what's actually typed on screen
 last_typed_text = ""
 last_transcribed_text = ""
+typed_char_count = 0  # Track actual characters typed
 
 # Whisper model (loaded once)
 whisper_model = None
@@ -42,7 +46,6 @@ def load_whisper_model():
         if whisper_model is None:
             print("Loading Whisper model (base)... this may take a moment")
             from faster_whisper import WhisperModel
-            # Use base model - downloads automatically on first run
             whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
             print("✅ Whisper model loaded")
     return whisper_model
@@ -105,16 +108,17 @@ def transcribe_thread():
 
 def type_text(new_text, previous_text):
     """Type only the new text (delta) to active window."""
-    global last_typed_text
+    global last_typed_text, typed_char_count
     
     if not new_text:
         return
     
     # If there's no previous text, type everything
     if not previous_text:
-        print(f"📝 Typing: {new_text}")
+        print(f"📝 Typing full: {new_text}")
         pyautogui.write(new_text, interval=0.02)
         last_typed_text = new_text
+        typed_char_count = len(new_text)
         return
     
     # Find the delta - what new text was added
@@ -129,17 +133,33 @@ def type_text(new_text, previous_text):
     # Get the new part that wasn't in previous transcription
     new_delta = new_text[common_prefix_len:].strip()
     
-    if new_delta:
-        print(f"📝 Typing delta: {new_delta}")
-        pyautogui.write(new_delta, interval=0.02)
+    # Skip if delta is too short (avoid noise/single chars)
+    if len(new_delta) < MIN_DELTA_LENGTH:
+        print(f"  ⏭️ Skipping delta (too short): '{new_delta}'")
+        return
+    
+    # Skip if new text is NOT longer than what we've typed
+    # This handles the case where Whisper rewrites the sentence
+    if len(new_text) <= typed_char_count:
+        print(f"  ⏭️ Skipping - no new content")
+        return
+    
+    # Calculate actual new content based on what we've typed
+    # Start from where we left off
+    actual_delta = new_text[typed_char_count:].strip()
+    
+    if actual_delta and len(actual_delta) >= MIN_DELTA_LENGTH:
+        print(f"📝 Typing delta: '{actual_delta}'")
+        pyautogui.write(actual_delta, interval=0.02)
         last_typed_text = new_text
+        typed_char_count += len(actual_delta)
     else:
-        print(f"📝 No new text (same as before)")
+        print(f"  ⏭️ No valid delta to type")
 
 
 def toggle_listening():
     """Toggle listening state."""
-    global is_listening, stream, last_typed_text, last_transcribed_text
+    global is_listening, stream, last_typed_text, last_transcribed_text, typed_char_count
     
     if is_listening:
         # Stop listening
@@ -158,6 +178,7 @@ def toggle_listening():
         # Reset tracking
         last_typed_text = ""
         last_transcribed_text = ""
+        typed_char_count = 0
         
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
